@@ -1,7 +1,5 @@
 # -*- coding: utf-8 -*-
 """
-Created on Wed Nov 19 13:40:31 2025
-
 @author: Sharon
 """
 
@@ -11,3 +9,10 @@ A Python program that simulates X-ray and neutron diffraction patterns from simp
 ## How to Run
 ```bash
 python diffraction_simulator.py
+```
+
+### Requirements
+- Python 3.9+
+- numpy
+- scipy
+- matplotlib

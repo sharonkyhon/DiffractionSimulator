@@ -11,21 +11,20 @@ Created on Sat Oct 25 23:37:00 2025
 # This script implements Phase 1-3 basics: simple lattice, structure
 # factors, and a powder-pattern generator with Gaussian peak broadening.
 
+
 # %%
 """Imports and small helpers"""
 import numpy as np
 import matplotlib.pyplot as plt
-from math import pi, sin, asin, sqrt
+from math import pi, asin
 from scipy.signal import fftconvolve
 from scipy.special import erf
 
 # %%
 """Physical constants & simple atomic scattering approximation
-Note: for a starter notebook we approximate X-ray atomic form factors f_j
-with a simple Z-dependent scaling. For realistic patterns, replace with
-lookup tables (e.g., Cromer-Mann parameters) or use pymatgen/ase.
+Note: here we approximate X-ray atomic form factors f_j with a simple Z-dependent scaling.
+For realistic patterns, replace with lookup tables (e.g., Cromer-Mann parameters) or use pymatgen/ase.
 """
-# speed of light etc. (not strictly needed here)
 # Basic approximate X-ray form factor (very rough):
 def approx_xray_form_factor(Z, q):
     """Very rough form factor: f ~ Z * exp(-alpha * q^2).
@@ -35,7 +34,7 @@ def approx_xray_form_factor(Z, q):
     alpha = 0.005 + 0.02 * (Z / 30.0)
     return Z * np.exp(-alpha * q**2)
 
-# For neutrons you would use element-specific scattering lengths (constant w.r.t q).
+# For neutrons, would use element-specific scattering lengths (constant w.r.t. q).
 
 # %%
 """Lattice and reciprocal-lattice utilities"""
@@ -44,7 +43,10 @@ def generate_simple_cell(kind='fcc', a=3.566):
     """Return lattice vectors and fractional atomic positions for
     a small set of example crystals. a in Angstrom.
 
-    Returns: (lattice_vectors (3x3 array), atoms list of tuples (element, frac_pos))
+    Atoms may be returned as (element, frac) or (element, frac, B) where
+    B is an isotropic Debye-Waller parameter (Å^2). If B is omitted, B=0.0.
+
+    Returns: (lattice_vectors (3x3 array), atoms list)
     """
     if kind == 'sc':
         lat = np.diag([a, a, a])
@@ -57,9 +59,10 @@ def generate_simple_cell(kind='fcc', a=3.566):
         ]
     elif kind == 'rocksalt':
         lat = np.diag([a, a, a])
+        # Example isotropic B factors in Å^2 (set to 0.0 if unknown)
         atoms = [
-            ('Na', np.array([0.0, 0.0, 0.0])),
-            ('Cl', np.array([0.5, 0.5, 0.5]))
+            ('Na', np.array([0.0, 0.0, 0.0]), 0.5),
+            ('Cl', np.array([0.5, 0.5, 0.5]), 0.6)
         ]
     else:
         raise ValueError('Unknown cell kind')
@@ -82,7 +85,7 @@ def reciprocal_lattice(lat):
 We will generate reflections within a max |h|,|k|,|l| range and filter by
 magnitude of G (scattering vector) if desired.
 """
-
+# Note that (000) is skipped
 def generate_hkl_list(hmax=4):
     hkls = []
     for h in range(-hmax, hmax+1):
@@ -94,46 +97,95 @@ def generate_hkl_list(hmax=4):
     return hkls
 
 # %%
-"""Structure factor and intensity calculation
+"""Structure factor and intensity calculation with DW and LP support
 """
 
-def structure_factor(h,k,l, atoms, lat, rec_lat, wavelength, particle='xray'):
-    """Compute structure factor F_hkl and intensity I_hkl for given h,k,l.
-    atoms: list of (element, frac_pos)
-    lat: real-space lattice (3x3)
-    rec_lat: reciprocal lattice (3x3)
-    wavelength: radiation wavelength in Angstrom
-    particle: 'xray' or 'neutron' (neutron uses constant scattering lengths)
+# --- atom helpers: allow atoms to be (el, frac) or (el, frac, B) ---
+def _atom_symbol(atom):
+    return atom[0]
 
-    Returns (Gvec (1/A), q=|G|, d_spacing, theta (rad), F, I)
+def _atom_frac(atom):
+    return atom[1]
+
+def _atom_B(atom):
+    """Return isotropic B (Å^2) if provided, else 0.0."""
+    if len(atom) >= 3:
+        return float(atom[2])
+    return 0.0
+
+
+def structure_factor(h, k, l, atoms, lat, rec_lat, wavelength, particle='xray',
+                     apply_DW=True, apply_LP=True):
+    """Compute structure factor and intensity for h,k,l.
+
+    New behavior:
+    - atoms may be (el, frac) or (el, frac, B) where B is isotropic Debye-Waller (Å^2)
+    - If apply_DW True, multiply atomic form factor by exp(-B * (sinθ / λ)^2)
+    - If apply_LP True and particle=='xray', compute Lorentz-polarisation factor Lp
+
+    Returns dict with keys: 'G','q','d','theta','F','I0','Lp','mult','I','hkl'
+    Note: I0 is |F|^2 (before LP and multiplicity); I includes LP and multiplicity.
     """
     # G vector in 1/Angstrom
     G = h*rec_lat[0] + k*rec_lat[1] + l*rec_lat[2]
     q = np.linalg.norm(G)
     if q == 0:
         return None
+
     # d spacing: |G| = 2*pi/d -> d = 2*pi/|G|
     d = 2*pi / q
+
     # Bragg angle (theta) from lambda = 2 d sin theta (first order)
     arg = wavelength / (2*d)
     if abs(arg) > 1.0:
-        theta = None  # no reflection for this wavelength
+        theta = None
     else:
         theta = asin(arg)
 
-    # compute F
+    # compute structure factor F (complex)
     F = 0+0j
-    for (el, frac) in atoms:
-        # convert fractional to cartesian r = frac dot lattice
-        r = frac[0]*lat[0] + frac[1]*lat[1] + frac[2]*lat[2]
+    for atom in atoms:
+        el = _atom_symbol(atom)
+        frac = _atom_frac(atom)
         phase = np.exp(2j * pi * (h*frac[0] + k*frac[1] + l*frac[2]))
         if particle == 'xray':
-            f = approx_xray_form_factor(atomic_number_guess(el), q)
+            f0 = approx_xray_form_factor(atomic_number_guess(el), q)
         else:
-            f = neutron_scattering_length_guess(el)
+            f0 = neutron_scattering_length_guess(el)
+
+        # Debye-Waller damping factor (isotropic, if theta is known)
+        if apply_DW and theta is not None:
+            sin_theta_over_lambda = np.sin(theta) / wavelength
+            B = _atom_B(atom)
+            DW = np.exp(-B * (sin_theta_over_lambda**2))
+        else:
+            DW = 1.0
+
+        f = f0 * DW
         F += f * phase
-    I = (np.abs(F))**2
-    return {'G':G, 'q':q, 'd':d, 'theta':theta, 'F':F, 'I':I, 'hkl':(h,k,l)}
+
+    I0 = (np.abs(F))**2  # base intensity (no LP, no multiplicity)
+
+    # Lorentz-polarisation (Bragg-Brentano formula for unpolarized X-rays)
+    Lp = 1.0
+    if apply_LP and particle == 'xray' and (theta is not None):
+        s = np.sin(theta)
+        c = np.cos(theta)
+        # guard against division by zero near 0 or 90 deg
+        if s <= 1e-12 or c <= 1e-12:
+            Lp = 1.0
+        else:
+            # (1 + cos^2 2θ) / (sin^2 θ * cos θ)
+            # note: this is the combined Lorentz-polarisation factor up to an overall scale.
+            Lp = (1.0 + np.cos(2*theta)**2) / (s**2 * c)
+
+    # multiplicity placeholder (will be set by simulate_powder grouping)
+    mult = 1
+
+    # final intensity placeholder (I0 * Lp * mult); simulate_powder will recompute mult
+    I = I0 * Lp * mult
+
+    return {'G':G, 'q':q, 'd':d, 'theta':theta, 'F':F, 'I0':I0, 'Lp':Lp, 'mult':mult, 'I':I, 'hkl':(h,k,l)}
 
 # %%
 """Very small helper to guess atomic number from element symbol.
@@ -146,11 +198,12 @@ def atomic_number_guess(symbol):
         'Na':11,'Mg':12,'Al':13,'Si':14,'P':15,'S':16,'Cl':17,'Ar':18,
         'K':19,'Ca':20,'Sc':21,'Ti':22,'V':23,'Cr':24,'Mn':25,'Fe':26,'Co':27,'Ni':28,'Cu':29,'Zn':30
     }
-    return table.get(symbol.capitalize(), 14)  # default to Si=14
+    return table.get(symbol.capitalize(), 14)  # default to Si=14 if symbol not known
 
 
 def neutron_scattering_length_guess(symbol):
     # Very rough placeholder: use Z as proxy
+    # Guessing neutron scattering length for that particular element
     return float(atomic_number_guess(symbol)) * 0.1
 
 # %%
@@ -177,7 +230,8 @@ def reflections_to_pattern(reflections, wavelength, two_theta_range=(0.5,90.0),
         profile = I * np.exp(-0.5 * ((two_theta - t_deg)/sigma)**2)
         pattern += profile
     # normalize for display
-    pattern /= np.max(pattern)
+    if np.max(pattern) > 0:
+        pattern /= np.max(pattern)
     return two_theta, pattern
 
 # %%
@@ -185,21 +239,53 @@ def reflections_to_pattern(reflections, wavelength, two_theta_range=(0.5,90.0),
 """
 
 def simulate_powder(kind='fcc', a=3.566, wavelength=1.5406, hmax=4,
-                     two_theta_range=(5,90), fwhm=0.2, particle='xray'):
+                     two_theta_range=(5,90), fwhm=0.2, particle='xray',
+                     apply_DW=True, apply_LP=True, d_tol=1e-5):
+    """
+    Simulate a powder pattern; computes multiplicity by grouping by d-spacing.
+
+    d_tol: absolute tolerance (Å) for grouping d-spacings. Increase if want more aggressive grouping (e.g. 1e-3).
+    """
     lat, atoms = generate_simple_cell(kind=kind, a=a)
     rec_lat = reciprocal_lattice(lat)
     hkls = generate_hkl_list(hmax=hmax)
-    refs = []
+
+    # compute raw reflections (with I0, Lp computed)
+    raw_refs = []
     for (h,k,l) in hkls:
-        out = structure_factor(h,k,l, atoms, lat, rec_lat, wavelength, particle)
+        out = structure_factor(h,k,l, atoms, lat, rec_lat, wavelength, particle,
+                               apply_DW=apply_DW, apply_LP=apply_LP)
         if out is None:
             continue
-        # Only keep reflections that satisfy Bragg (theta not None)
         if out['theta'] is not None:
-            # apply simple multiplicity factor (ignore equivalent reflections for demo)
-            refs.append(out)
+            raw_refs.append(out)
+
+    # group reflections by d within tolerance to compute multiplicity
+    raw_refs_sorted = sorted(raw_refs, key=lambda r: r['d'])
+    grouped = []
+    i = 0
+    n = len(raw_refs_sorted)
+    while i < n:
+        base = raw_refs_sorted[i]
+        group = [base]
+        j = i + 1
+        while j < n and abs(raw_refs_sorted[j]['d'] - base['d']) <= d_tol:
+            group.append(raw_refs_sorted[j])
+            j += 1
+        # multiplicity is number of equivalent reflections in the group
+        mult = len(group)
+        # pick representative (first) and set multiplicity and recompute I
+        rep = group[0].copy()
+        rep['mult'] = mult
+        # recompute I: use I0 * Lp * mult
+        rep['I'] = rep['I0'] * rep['Lp'] * mult
+        rep['members'] = [g['hkl'] for g in group]
+        grouped.append(rep)
+        i = j
+
     # sort by 2theta
-    refs_sorted = sorted(refs, key=lambda r: np.degrees(2*r['theta']))
+    refs_sorted = sorted(grouped, key=lambda r: np.degrees(2*r['theta']))
+
     two_theta, pattern = reflections_to_pattern(refs_sorted, wavelength,
                                                  two_theta_range, npoints=3000, fwhm=fwhm)
     return {'two_theta':two_theta, 'pattern':pattern, 'refs':refs_sorted}
@@ -209,20 +295,25 @@ def simulate_powder(kind='fcc', a=3.566, wavelength=1.5406, hmax=4,
 Run this section in Spyder to see results. Modify parameters interactively.
 """
 if __name__ == '__main__':
-    res = simulate_powder(kind='rocksalt', a=5.64, wavelength=1.5406, hmax=4,
-                          two_theta_range=(10,80), fwhm=0.3)
+    # Example: NaCl (rocksalt)
+    res = simulate_powder(kind='rocksalt', a=5.64, wavelength=1.5406, hmax=6,
+                          two_theta_range=(10,80), fwhm=0.3,
+                          particle='xray', apply_DW=True, apply_LP=True, d_tol=1e-4)
+
     plt.figure(figsize=(8,4))
-    plt.plot(res['two_theta'], res['pattern'])
+    plt.plot(res['two_theta'], res['pattern'], lw=1)
     plt.xlabel(r"$2\theta$ [$^\circ$]")
-    plt.ylabel(r'Normalized intensity [$Wm^{-2}$]')
-    plt.title('Simulated powder X-ray pattern')
+    plt.ylabel('Normalized intensity')
+    plt.title('Simulated powder X-ray pattern (with L·P, DW, multiplicity)')
+
     # annotate a few strongest peaks
-    top = sorted(res['refs'], key=lambda r: r['I'], reverse=True)[:6]
+    top = sorted(res['refs'], key=lambda r: r['I'], reverse=True)[:8]
     for r in top:
         tdeg = np.degrees(2*r['theta'])
-        #plt.axvline(tdeg, color='gray', linestyle='--', alpha=0.5)
         hkl = r['hkl']
-        #plt.text(tdeg+0.2, 0.6, f"{hkl}", rotation=90, va='bottom')
+        plt.axvline(tdeg, color='gray', linestyle='--', alpha=0.4)
+        plt.text(tdeg+0.15, 0.6, f"{hkl}", rotation=90, va='bottom', fontsize=8)
+
     plt.xlim(10,80)
     plt.tight_layout()
     plt.show()
@@ -230,18 +321,7 @@ if __name__ == '__main__':
 # %%
 """Notes & next steps (in-code):
 - Replace approx_xray_form_factor with Cromer-Mann or library values.
-- Add multiplicity, Lorentz-polarization, and Debye-Waller factors.
-- Read CIFs via pymatgen/ase and support arbitrary unit cells.
-- Implement peak-shape models (pseudo-Voigt) and background.
-"""
-
-# %%
-""" Inclusion of Lorentz-polarisation factor
-"""
-
-
-
-
-# %%
-""" Inclusion of Debye-Waller factor 
+- Use spglib or CIF parsing for symmetry-aware multiplicities and systematic absences.
+- Add Lorentzian/Gaussian instrument convolution (pseudo-Voigt) and background.
+- Implement anisotropic Debye-Waller if needed (requires U-tensors).
 """

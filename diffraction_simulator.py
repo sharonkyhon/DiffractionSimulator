@@ -5,13 +5,6 @@ Created on Sat Oct 25 23:37:00 2025
 @author: Sharon
 """
 
-# Diffraction simulator starter script (Spyder-friendly)
-# ----------------------------------------------------
-# Use Spyder's code cells ("# %%") to run sections interactively.
-# This script implements Phase 1-3 basics: simple lattice, structure
-# factors, and a powder-pattern generator with Gaussian peak broadening.
-
-
 # %%
 """Imports and small helpers"""
 import numpy as np
